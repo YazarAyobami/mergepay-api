@@ -1,0 +1,208 @@
+/**
+ * Treasury multisig proposal routes — Issue #41.
+ *
+ *   POST   /groups/:groupId/treasury/proposals
+ *     Admin creates a payment proposal; backend builds the unsigned XDR.
+ *   GET    /groups/:groupId/treasury/proposals
+ *     List proposals with status & signature count.
+ *   POST   /groups/:groupId/treasury/proposals/:proposalId/sign
+ *     Member posts their signed XDR; backend verifies the signature,
+ *     appends to the proposal, and auto-submits when threshold is met.
+ *   GET    /groups/:groupId/treasury/status
+ *     Return treasury multisig account info (balance, signers, threshold).
+ *     Same data as the existing `/groups/:id/treasury` route, exposed under
+ *     the path the issue spec requests.
+ */
+
+import { FastifyInstance } from "fastify";
+import { z } from "zod";
+import { prisma } from "../db";
+import { mpMemoSchema, stellarAccountIdSchema } from "../lib/stellar-validation";
+import { assetCodeSchema, assetIssuerSchema } from "../schemas/asset";
+import { rateLimited } from "../lib/rate-limit";
+import { config } from "../config";
+import { Errors } from "../errors";
+import { requireUser } from "../plugins/auth";
+import { requireGroupRole } from "../middleware";
+import { getTreasuryAccount } from "../services/treasury-stellar";
+import { isPositive } from "../services/money";
+import { serializeGroup, serializeTreasuryProposal } from "../serializers";
+import { treasuryProposalsService } from "../services/treasury-proposals";
+import {
+  buildPage,
+  cursorFilter,
+  cursorOrderBy,
+  paginationQuerySchema,
+  requireCursor,
+  takeForPage,
+} from "../lib/pagination";
+
+const createBodySchema = z.object({
+  destination: stellarAccountIdSchema,
+  amount: z.string().min(1),
+  assetCode: assetCodeSchema,
+  assetIssuer: assetIssuerSchema.nullable().optional(),
+  memo: mpMemoSchema.optional(),
+});
+
+const signBodySchema = z.object({
+  signedXdr: z.string().min(1),
+});
+
+export default async function treasuryProposalRoutes(app: FastifyInstance) {
+  app.addHook("preHandler", app.authenticate);
+
+  // -- POST /groups/:groupId/treasury/proposals -------------------------------
+  app.post(
+    "/groups/:groupId/treasury/proposals",
+    {
+      ...rateLimited("treasuryPropose"),
+      preHandler: requireGroupRole("admin", { param: "groupId" }),
+    },
+    async (req) => {
+    const auth = requireUser(req);
+    const { groupId } = z.object({ groupId: z.string() }).parse(req.params);
+    const body = createBodySchema.parse(req.body);
+
+    if (!isPositive(body.amount)) {
+      throw Errors.badRequest("invalid_amount", "Amount must be positive");
+    }
+
+    const group = await prisma.group.findUnique({ where: { id: groupId } });
+    if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
+      throw Errors.badRequest(
+        "treasury_disabled",
+        "Treasury is not enabled for this group"
+      );
+    }
+
+    const threshold = group.treasuryRequiredSigners ?? 1;
+
+    const { proposal, xdr, networkPassphrase } =
+      await treasuryProposalsService.create(
+        {
+          groupId,
+          creatorId: auth.id,
+          creatorPublicKey: auth.stellarPublicKey,
+          destination: body.destination,
+          amount: body.amount,
+          assetCode: body.assetCode,
+          assetIssuer: body.assetIssuer ?? null,
+          memo: body.memo ?? null,
+        },
+        threshold
+      );
+
+    return {
+      proposal: serializeTreasuryProposal(proposal),
+      xdr,
+      networkPassphrase,
+    };
+  });
+
+  // -- GET /groups/:groupId/treasury/proposals --------------------------------
+  //
+  // Paginated on the shared cursor convention (src/lib/pagination.ts). A
+  // treasury accumulates proposals indefinitely — every payment a group has
+  // ever proposed, signed or abandoned — so an unbounded read grew without
+  // limit with the group's age and loaded the whole history to render a screen
+  // that shows the most recent few.
+  //
+  // Membership is checked before any row is read, and the `groupId` filter is
+  // what scopes the page. The cursor only moves where a page starts inside
+  // that already-authorized scope; it never widens it.
+  app.get(
+    "/groups/:groupId/treasury/proposals",
+    { preHandler: requireGroupRole("member", { param: "groupId" }) },
+    async (req) => {
+    const { groupId } = z.object({ groupId: z.string() }).parse(req.params);
+
+    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
+    const position = requireCursor(cursor);
+
+    const proposals = await prisma.treasuryProposal.findMany({
+      where: { groupId, ...cursorFilter(position, order) },
+      orderBy: cursorOrderBy(order),
+      take: takeForPage(limit),
+    });
+
+    const { items, meta } = buildPage(proposals, limit, order);
+    return { proposals: items.map(serializeTreasuryProposal), meta };
+  });
+
+  // -- POST /groups/:groupId/treasury/proposals/:proposalId/sign --------------
+  app.post(
+    "/groups/:groupId/treasury/proposals/:proposalId/sign",
+    {
+      ...rateLimited("treasurySubmit"),
+      preHandler: requireGroupRole("member", { param: "groupId" }),
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const { groupId, proposalId } = z
+        .object({ groupId: z.string(), proposalId: z.string() })
+        .parse(req.params);
+      // The service enforces the persisted proposal/group relationship. Keep
+      // authorization based on the authenticated member and requested group,
+      // without performing a second resource lookup that changes legacy error
+      // behavior for proposal-state validation.
+      const body = signBodySchema.parse(req.body);
+
+      // Load group members to constrain which signers are accepted.
+      const members = await prisma.groupMember.findMany({
+        where: { groupId },
+        include: { user: true },
+      });
+      const memberPublicKeys = members.map((m) => m.user.stellarPublicKey);
+
+      const result = await treasuryProposalsService.submitSignatures({
+        proposalId,
+        groupId,
+        memberPublicKeys,
+        signedXdr: body.signedXdr,
+        userId: auth.id,
+      });
+
+      // The service writes signature/submission audit records inside its
+      // transaction; do not add a second best-effort record after commit.
+
+      const proposal = await prisma.treasuryProposal.findUnique({
+        where: { id: proposalId },
+      });
+      return {
+        proposal: serializeTreasuryProposal(proposal),
+        signatureCount: result.signatureCount,
+        threshold: result.threshold,
+        status: result.status,
+        stellarTxHash: result.stellarTxHash,
+      };
+    }
+  );
+
+  // -- GET /groups/:groupId/treasury/status -----------------------------------
+  app.get(
+    "/groups/:groupId/treasury/status",
+    { preHandler: requireGroupRole("member", { param: "groupId" }) },
+    async (req) => {
+    const { groupId } = z.object({ groupId: z.string() }).parse(req.params);
+
+    const group = await prisma.group.findUnique({ where: { id: groupId } });
+    if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
+      throw Errors.badRequest(
+        "treasury_disabled",
+        "Treasury is not enabled for this group"
+      );
+    }
+
+    const view = await getTreasuryAccount(group.treasuryAccountPublicKey);
+    return {
+      group: serializeGroup(group),
+      publicKey: view.publicKey,
+      balances: view.balances,
+      signers: view.signers,
+      thresholds: view.thresholds,
+      requiredSigners: group.treasuryRequiredSigners ?? 1,
+      networkPassphrase: config.networkPassphrase,
+    };
+  });
+}

@@ -2,6 +2,34 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { Keypair, Transaction } from "@stellar/stellar-sdk";
 
 const h = vi.hoisted(() => {
+  // Fingerprint -> expiry (ms). Stands in for the `sep10_challenges` table's
+  // unique fingerprint index; cleared between tests.
+  const sep10Challenges = new Map<string, number>();
+  // Drives the real conditional-insert replay path in src/services/sep10.ts
+  // (`$executeRaw` "INSERT ... ON CONFLICT DO NOTHING"). The synchronous
+  // check-and-set mirrors the database's unique index, so concurrent
+  // verification resolves to one winner rather than being mocked away.
+  const executeRaw = vi.fn(async (sql: { strings: string[]; values: unknown[] }) => {
+    const text = sql.strings.join("?");
+    if (text.includes("INSERT INTO")) {
+      const [fingerprint, expiresAt] = sql.values as [string, Date];
+      if (sep10Challenges.has(fingerprint)) return 0; // ON CONFLICT DO NOTHING
+      sep10Challenges.set(fingerprint, expiresAt.getTime());
+      return 1;
+    }
+    if (text.includes("DELETE FROM")) {
+      const now = Date.now();
+      let deleted = 0;
+      for (const [fingerprint, expiresAt] of sep10Challenges) {
+        if (expiresAt <= now) {
+          sep10Challenges.delete(fingerprint);
+          deleted += 1;
+        }
+      }
+      return deleted;
+    }
+    return 0;
+  });
   const model = () => ({
     create: vi.fn(),
     createMany: vi.fn(),
@@ -28,12 +56,17 @@ const h = vi.hoisted(() => {
     anchorSession: model(),
     auditLog: model(),
     idempotencyKey: model(),
+    refreshToken: model(),
+    $queryRawUnsafe: vi.fn(async () => [{ "?column?": 1 }]),
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
     ),
+    $queryRaw: vi.fn(),
+    $executeRaw: executeRaw,
     $disconnect: vi.fn(),
   };
-  return { prisma };
+  const mockFetchBaseFee = vi.fn();
+  return { prisma, mockFetchBaseFee, sep10Challenges };
 });
 
 vi.mock("../src/db", () => ({ prisma: h.prisma }));
@@ -50,6 +83,19 @@ vi.mock("../src/services/stellar", async (importActual) => {
         balances: [],
         signers: [],
         thresholds: { low: 0, med: 0, high: 0 },
+      })),
+    },
+  };
+});
+
+vi.mock("@stellar/stellar-sdk", async (importActual) => {
+  const actual = await importActual<typeof import("@stellar/stellar-sdk")>();
+  return {
+    ...actual,
+    Horizon: {
+      Server: vi.fn().mockImplementation(() => ({
+        fetchBaseFee: h.mockFetchBaseFee,
+        feeStats: h.mockFetchBaseFee,
       })),
     },
   };
@@ -73,6 +119,13 @@ const prisma = h.prisma;
 
 beforeEach(async () => {
   vi.clearAllMocks();
+  h.sep10Challenges.clear();
+  // Reset $transaction to default behavior (passes prisma mock to callback)
+  h.prisma.$transaction.mockImplementation(async (arg: any) =>
+    typeof arg === "function" ? arg(h.prisma) : Promise.all(arg)
+  );
+  // Reset auditLog.create to default resolved
+  h.prisma.auditLog.create.mockImplementation(() => Promise.resolve({}));
   if (!app) app = await buildApp();
 });
 
@@ -83,9 +136,14 @@ function authHeader(user = fakeUser()) {
 
 describe("auth routes", () => {
   it("GET /health is open", async () => {
+    // The health service uses $queryRawUnsafe and getFeeStats (Horizon).
+    h.prisma.$queryRawUnsafe.mockResolvedValueOnce([{ "?column?": 1 }]);
+    h.mockFetchBaseFee.mockResolvedValueOnce(100);
     const res = await app.inject({ method: "GET", url: "/health" });
     expect(res.statusCode).toBe(200);
     expect(res.json().status).toBe("ok");
+    expect(res.json().database.connected).toBe(true);
+    expect(res.json().stellar.reachable).toBe(true);
   });
 
   it("POST /auth/challenge returns a transaction + passphrase", async () => {
@@ -109,8 +167,7 @@ describe("auth routes", () => {
     });
     expect(res.statusCode).toBe(400);
     const body = res.json();
-    expect(body.error).toBe("INVALID_ACCOUNT");
-    expect(body.statusCode).toBe(400);
+    expect(body.code).toBe("VALIDATION_ERROR");
     expect(body.requestId).toBeTruthy();
   });
 
@@ -135,12 +192,108 @@ describe("auth routes", () => {
     expect(body.user.stellarPublicKey).toBe(client.publicKey());
   });
 
+  it("POST /auth/verify does not issue a JWT when the challenge fails validation", async () => {
+    // A well-formed challenge without the client's signature gets the
+    // verifier's actionable 401, but must never issue a token or persist a user.
+    const client = Keypair.random();
+    const { transaction } = buildChallenge(client.publicKey());
+    const res = await app.inject({
+      method: "POST",
+      url: "/auth/verify",
+      payload: { transaction },
+    });
+    expect(res.statusCode).toBe(401);
+    const body = res.json();
+    expect(body.code).toBe("UNAUTHORIZED");
+    expect(body.message).toContain("Challenge signature verification failed");
+    expect(body.requestId).toBeTruthy();
+    expect(body.token).toBeUndefined();
+    expect(prisma.user.upsert).not.toHaveBeenCalled();
+    expect(prisma.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it("POST /auth/verify rejects malformed XDR before challenge verification", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/auth/verify",
+      payload: { transaction: "not-a-valid-challenge-xdr" },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(prisma.user.upsert).not.toHaveBeenCalled();
+    expect(prisma.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it("POST /auth/verify rejects replaying an already-consumed challenge", async () => {
+    const client = Keypair.random();
+    const user = fakeUser({ stellarPublicKey: client.publicKey() });
+    prisma.user.upsert.mockResolvedValueOnce(user);
+
+    const { transaction, networkPassphrase } = buildChallenge(client.publicKey());
+    const tx = new Transaction(transaction, networkPassphrase);
+    tx.sign(client);
+    const payload = { transaction: tx.toXDR() };
+
+    const first = await app.inject({
+      method: "POST",
+      url: "/auth/verify",
+      payload,
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json().token).toBeTruthy();
+
+    // The exact same signed challenge, exchanged again: the durable replay
+    // store must reject it with the same opaque 401 and issue no JWT.
+    const second = await app.inject({
+      method: "POST",
+      url: "/auth/verify",
+      payload,
+    });
+    expect(second.statusCode).toBe(401);
+    const body = second.json();
+    expect(body.code).toBe("UNAUTHORIZED");
+    expect(body.message).toBe("Invalid or expired authentication challenge");
+    expect(body.token).toBeUndefined();
+
+    // No second session or user was minted.
+    expect(prisma.user.upsert).toHaveBeenCalledTimes(1);
+  });
+
+  it("POST /auth/verify issues exactly one JWT under concurrent use of the same challenge", async () => {
+    const client = Keypair.random();
+    const user = fakeUser({ stellarPublicKey: client.publicKey() });
+    prisma.user.upsert.mockResolvedValueOnce(user);
+
+    const { transaction, networkPassphrase } = buildChallenge(client.publicKey());
+    const tx = new Transaction(transaction, networkPassphrase);
+    tx.sign(client);
+    const payload = { transaction: tx.toXDR() };
+
+    // Three simultaneous verifications of the identical envelope. The replay
+    // store's unique index is the arbiter: exactly one may win.
+    const responses = await Promise.all(
+      Array.from({ length: 3 }, () =>
+        app.inject({ method: "POST", url: "/auth/verify", payload })
+      )
+    );
+
+    const ok = responses.filter((r) => r.statusCode === 200);
+    const rejected = responses.filter((r) => r.statusCode === 401);
+
+    expect(ok).toHaveLength(1);
+    expect(rejected).toHaveLength(2);
+    expect(ok[0].json().token).toBeTruthy();
+    for (const r of rejected) {
+      expect(r.json().code).toBe("UNAUTHORIZED");
+      expect(r.json().token).toBeUndefined();
+    }
+    expect(prisma.user.upsert).toHaveBeenCalledTimes(1);
+  });
+
   it("GET /me requires a token", async () => {
     const res = await app.inject({ method: "GET", url: "/me" });
     expect(res.statusCode).toBe(401);
     const body = res.json();
-    expect(body.error).toBe("UNAUTHORIZED");
-    expect(body.statusCode).toBe(401);
+    expect(body.code).toBe("UNAUTHORIZED");
     expect(body.requestId).toBeTruthy();
   });
 
@@ -194,10 +347,9 @@ describe("group routes", () => {
     });
     expect(res.statusCode).toBe(400);
     const body = res.json();
-    expect(body.error).toBe("VALIDATION_ERROR");
-    expect(body.statusCode).toBe(400);
+    expect(body.error.code).toBe("VALIDATION_ERROR");
     expect(body.requestId).toBeTruthy();
-    expect(Array.isArray(body.details)).toBe(true);
+    expect(Array.isArray(body.error.details)).toBe(true);
   });
 
   it("GET /groups/:id returns 403 for a non-member", async () => {
@@ -210,8 +362,7 @@ describe("group routes", () => {
     });
     expect(res.statusCode).toBe(403);
     const body = res.json();
-    expect(body.error).toBe("FORBIDDEN");
-    expect(body.statusCode).toBe(403);
+    expect(body.code).toBe("FORBIDDEN");
     expect(body.requestId).toBeTruthy();
   });
 
@@ -256,15 +407,23 @@ describe("group routes", () => {
   });
 
   describe("POST /groups/:id/invite (direct invitation by public key)", () => {
-    const validPubKey = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    // A checksum-valid key is required now that the route validates with
+    // StrKey (not just a regex) — Keypair.random() guarantees that.
+    const validPubKey = Keypair.random().publicKey();
+
+    /**
+     * The caller's admin membership is read twice: once by the route's
+     * `requireGroupRole("admin")` guard, and again inside the transaction
+     * (the re-check that closes the concurrent-demotion window).
+     */
+    function callerIsAdmin(user: { id: string }) {
+      const row = { groupId: "group_1", userId: user.id, role: "admin" };
+      prisma.groupMember.findUnique.mockResolvedValueOnce(row).mockResolvedValueOnce(row);
+    }
 
     it("returns 201 and creates an invitation", async () => {
       const user = fakeUser();
-      prisma.groupMember.findUnique.mockResolvedValueOnce({
-        groupId: "group_1",
-        userId: user.id,
-        role: "admin",
-      });
+      callerIsAdmin(user);
       prisma.user.findUnique.mockResolvedValueOnce(null);
       prisma.invitation.findFirst.mockResolvedValueOnce(null);
       const invitation = {
@@ -299,7 +458,8 @@ describe("group routes", () => {
         userId: user.id,
         role: "member",
       });
-      prisma.group.findUnique.mockResolvedValueOnce({ id: "group_1" });
+      // No group.findUnique mock: requireMembership only reads it when no
+      // membership row is found at all, which isn't the case here.
 
       const res = await app.inject({
         method: "POST",
@@ -309,11 +469,13 @@ describe("group routes", () => {
       });
 
       expect(res.statusCode).toBe(403);
-      expect(res.json().error).toBe("FORBIDDEN");
+      expect(res.json().error.code).toBe("FORBIDDEN");
     });
 
     it("returns 400 for an invalid public key", async () => {
       const user = fakeUser();
+      // The admin guard passes; the public key then fails validation before
+      // the route opens a transaction, so there is no second (in-tx) lookup.
       prisma.groupMember.findUnique.mockResolvedValueOnce({
         groupId: "group_1",
         userId: user.id,
@@ -328,16 +490,13 @@ describe("group routes", () => {
       });
 
       expect(res.statusCode).toBe(400);
+      expect(prisma.invitation.create).not.toHaveBeenCalled();
     });
 
     it("returns 409 when invitee is already a member", async () => {
       const user = fakeUser();
       const inviteeUser = fakeUser({ id: "user_2", stellarPublicKey: validPubKey });
-      prisma.groupMember.findUnique.mockResolvedValueOnce({
-        groupId: "group_1",
-        userId: user.id,
-        role: "admin",
-      });
+      callerIsAdmin(user);
       prisma.user.findUnique.mockResolvedValueOnce(inviteeUser);
       prisma.groupMember.findUnique.mockResolvedValueOnce({
         groupId: "group_1",
@@ -353,16 +512,12 @@ describe("group routes", () => {
       });
 
       expect(res.statusCode).toBe(409);
-      expect(res.json().error).toBe("ALREADY_MEMBER");
+      expect(res.json().error.code).toBe("ALREADY_MEMBER");
     });
 
     it("returns 409 when a pending invitation already exists", async () => {
       const user = fakeUser();
-      prisma.groupMember.findUnique.mockResolvedValueOnce({
-        groupId: "group_1",
-        userId: user.id,
-        role: "admin",
-      });
+      callerIsAdmin(user);
       prisma.user.findUnique.mockResolvedValueOnce(null);
       prisma.invitation.findFirst.mockResolvedValueOnce({
         id: "existing_inv",
@@ -377,7 +532,243 @@ describe("group routes", () => {
       });
 
       expect(res.statusCode).toBe(409);
-      expect(res.json().error).toBe("INVITATION_PENDING");
+      expect(res.json().error.code).toBe("INVITATION_PENDING");
     });
+
+    it("DELETE /groups/:id/members/:memberId removes member and creates audit log", async () => {
+      const admin = fakeUser({ id: "user_admin" });
+      const targetUser = fakeUser({ id: "user_target" });
+      // The caller's admin membership is read twice — once by the
+      // requireGroupRole preHandler and again by the in-transaction admin
+      // re-check (#700) — then the target's row is read by the handler.
+      const callerAdmin = {
+        groupId: "group_1",
+        userId: admin.id,
+        role: "admin",
+      };
+      prisma.groupMember.findUnique.mockResolvedValueOnce(callerAdmin);
+      prisma.groupMember.findUnique.mockResolvedValueOnce(callerAdmin);
+      prisma.groupMember.findUnique.mockResolvedValueOnce({
+        id: "member_target",
+        groupId: "group_1",
+        userId: targetUser.id,
+        role: "member",
+      });
+      prisma.groupMember.delete.mockResolvedValueOnce({});
+      prisma.auditLog.create.mockResolvedValue({});
+
+      const res = await app.inject({
+        method: "DELETE",
+        url: "/groups/group_1/members/user_target",
+        headers: authHeader(admin),
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.json().ok).toBe(true);
+      expect(prisma.groupMember.delete).toHaveBeenCalledWith({
+        where: { groupId_userId: { groupId: "group_1", userId: targetUser.id } },
+      });
+      // Group-scoped queries can find the event, and its target identifies the
+      // affected member rather than only the containing group.
+      expect(prisma.auditLog.create).toHaveBeenCalledWith({
+        data: {
+          userId: admin.id,
+          groupId: "group_1",
+          action: "group.member_remove",
+          entityType: "group_member",
+          entityId: targetUser.id,
+          metadata: {
+            targetUserId: targetUser.id,
+            removedRole: "member",
+            outcome: "success",
+          },
+        },
+      });
+    });
+
+    it("DELETE /groups/:id/members/:memberId returns 403 for non-admin", async () => {
+      const nonAdmin = fakeUser({ id: "user_member" });
+      prisma.groupMember.findUnique.mockResolvedValueOnce({
+        groupId: "group_1",
+        userId: nonAdmin.id,
+        role: "member",
+      });
+
+      const res = await app.inject({
+        method: "DELETE",
+        url: "/groups/group_1/members/user_target",
+        headers: authHeader(nonAdmin),
+      });
+
+      expect(res.statusCode).toBe(403);
+    });
+  });
+});
+
+describe("expense routes", () => {
+  it("POST /groups/:id/expenses creates an expense and audit log", async () => {
+    const user = fakeUser();
+    const groupId = "group_1";
+
+    prisma.groupMember.findMany.mockResolvedValueOnce([
+      { userId: user.id },
+      { userId: "user_2" },
+    ]);
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId,
+      userId: user.id,
+      role: "member",
+    });
+
+    const expense = {
+      id: "expense_1",
+      groupId,
+      payerUserId: user.id,
+      title: "Dinner",
+      description: "Team dinner",
+      amount: "100.00",
+      assetCode: "XLM",
+      assetIssuer: null,
+      splitType: "equal",
+      memo: "abc123",
+      receiptUrl: null,
+      createdAt: new Date(),
+      payer: user,
+      shares: [
+        { id: "share_1", expenseId: "expense_1", userId: user.id, shareAmount: "50.00", status: "settled", user },
+        { id: "share_2", expenseId: "expense_1", userId: "user_2", shareAmount: "50.00", status: "pending", user: { ...user, id: "user_2" } },
+      ],
+    };
+    prisma.expense.create.mockResolvedValueOnce(expense);
+    prisma.auditLog.create.mockResolvedValueOnce({});
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/groups/${groupId}/expenses`,
+      headers: authHeader(user),
+      payload: {
+        title: "Dinner",
+        description: "Team dinner",
+        amount: "100",
+        assetCode: "XLM",
+        splitType: "equal",
+        shares: [{ userId: user.id }, { userId: "user_2" }],
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().expense.title).toBe("Dinner");
+    expect(prisma.expense.create).toHaveBeenCalledOnce();
+    expect(prisma.auditLog.create).toHaveBeenCalledOnce();
+    expect(prisma.auditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          userId: user.id,
+          action: "expense.create",
+          entityType: "expense",
+          entityId: "expense_1",
+        }),
+      })
+    );
+  });
+
+  it("POST /groups/:id/expenses rolls back expense if audit log fails", async () => {
+    const user = fakeUser();
+    const groupId = "group_1";
+
+    prisma.groupMember.findMany.mockResolvedValueOnce([
+      { userId: user.id },
+      { userId: "user_2" },
+    ]);
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId,
+      userId: user.id,
+      role: "member",
+    });
+
+    // Make auditLog.create throw to simulate failure inside transaction
+    prisma.auditLog.create.mockImplementation(() => Promise.reject(new Error("DB error")));
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/groups/${groupId}/expenses`,
+      headers: authHeader(user),
+      payload: {
+        title: "Dinner",
+        amount: "100",
+        assetCode: "XLM",
+        splitType: "equal",
+        shares: [{ userId: user.id }, { userId: "user_2" }],
+      },
+    });
+
+    // Transaction should fail and return error
+    expect(res.statusCode).toBe(500);
+    
+    // Reset to default for next test
+    prisma.auditLog.create.mockImplementation(() => Promise.resolve({}));
+  });
+
+  it("DELETE /expenses/:id deletes expense and creates audit log", async () => {
+    const user = fakeUser();
+    const expenseId = "expense_1";
+
+    const expense = {
+      id: expenseId,
+      groupId: "group_1",
+      payerUserId: user.id,
+      title: "Dinner",
+      description: "Team dinner",
+      amount: "100.00",
+      assetCode: "XLM",
+      assetIssuer: null,
+      splitType: "equal",
+      memo: "abc123",
+      receiptUrl: null,
+      createdAt: new Date(),
+      shares: [
+        { id: "share_1", expenseId, userId: user.id, shareAmount: "50.00", status: "settled" },
+        { id: "share_2", expenseId, userId: "user_2", shareAmount: "50.00", status: "pending" },
+      ],
+    };
+    // The expense row and the admin membership are each read twice: once by
+    // the route's preHandler guard resolving the expense's group, once again
+    // by the handler's own in-transaction check and delete.
+    prisma.expense.findUnique.mockResolvedValueOnce(expense);
+    prisma.expense.findUnique.mockResolvedValueOnce(expense);
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: user.id,
+      role: "admin",
+    });
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId: "group_1",
+      userId: user.id,
+      role: "admin",
+    });
+    prisma.expense.delete.mockResolvedValueOnce({});
+    // Explicitly ensure auditLog.create resolves
+    prisma.auditLog.create.mockImplementation(() => Promise.resolve({}));
+
+    const res = await app.inject({
+      method: "DELETE",
+      url: `/expenses/${expenseId}`,
+      headers: authHeader(user),
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().ok).toBe(true);
+    expect(prisma.expense.delete).toHaveBeenCalledOnce();
+    expect(prisma.auditLog.create).toHaveBeenCalledOnce();
+    expect(prisma.auditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          userId: user.id,
+          action: "expense.delete",
+          entityType: "expense",
+          entityId: expenseId,
+        }),
+      })
+    );
   });
 });
