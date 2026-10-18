@@ -13,20 +13,41 @@ import { serializeExpense } from "../serializers";
 const shareInput = z.object({
   userId: z.string(),
   amount: z.string().optional(),
-  percent: z.number().optional(),
+  percent: z.number().min(0).max(100).optional(),
 });
+
+/** Supported asset codes for expenses. */
+const SUPPORTED_ASSETS = ["XLM", "USDC"] as const;
 
 const createExpenseSchema = z.object({
   title: z.string().min(1).max(80),
   description: z.string().max(500).optional(),
-  amount: z.string().min(1),
-  assetCode: z.string().min(1).max(12),
+  amount: z.string().refine((val) => {
+    // Must be a valid positive decimal string.
+    if (!/^\d+(\.\d+)?$/.test(val)) return false;
+    const num = Number(val);
+    return num > 0 && Number.isFinite(num);
+  }, "Amount must be a positive number"),
+  assetCode: z.enum(SUPPORTED_ASSETS, {
+    errorMap: () => ({ message: `Asset code must be one of: ${SUPPORTED_ASSETS.join(", ")}` }),
+  }),
   assetIssuer: z.string().nullable().optional(),
   splitType: z.enum(["equal", "custom", "percentage"]),
-  shares: z.array(shareInput).min(1),
+  shares: z.array(shareInput).min(1).refine((shares) => {
+    // For percentage splits, ensure total is <= 100.
+    if (shares.some((s) => s.percent !== undefined)) {
+      const total = shares.reduce((sum, s) => sum + (s.percent ?? 0), 0);
+      if (total > 100) return false;
+    }
+    // For custom splits with amounts, ensure all are non-negative.
+    if (shares.some((s) => s.amount !== undefined)) {
+      if (shares.some((s) => s.amount && !/^\d+(\.\d+)?$/.test(s.amount))) return false;
+    }
+    return true;
+  }, "Invalid share configuration: percentages must sum to ≤100, amounts must be non-negative"),
   payerUserId: z.string().optional(),
   memo: z.string().max(24).optional(),
-  receiptUrl: z.string().nullable().optional(),
+  receiptUrl: z.string().url("Receipt URL must be a valid URL").nullable().optional(),
 });
 
 const expenseInclude = {
